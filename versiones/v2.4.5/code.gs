@@ -624,7 +624,8 @@ const ACCIONES_SOLO_ADMIN = {
   estadoVentasResumidas: true, resumirVentasViejas: true,
   cerrarTodasLasSesiones: true,
   guardarDolarDeposito: true, guardarPreciosUsd: true, guardarConfigDocumentos: true,
-  claveTraspasos: true, vincularDeposito: true, anularTraspaso: true
+  claveTraspasos: true, vincularDeposito: true, anularTraspaso: true,
+  repararStockPedidos: true
 };
 
 // Lo único que puede hacer la contraseña de stock.html (depósito desde el celular).
@@ -1080,6 +1081,9 @@ case "agotados":
 
 case "stockBajo":
   return getStockBajo();
+
+case "repararStockPedidos":
+  return repararStockPedidos(e);
 
 case "actualizarEstado":
 return conIdempotencia(e.parameter.idOperacionSync, function(){ return actualizarEstado(e); });
@@ -8987,6 +8991,120 @@ function devolverStockPorPedido(pedidoId, estricto){
 
   descontarStockPorVenta(carrito, estricto);
 }
+
+/**
+ * REPARACIÓN ÚNICA: pedidos que ya salieron (PREPARANDO o ENVIADO) pero
+ * cuyo stock nunca se descontó (STOCK_DESCONTADO distinto de "SI").
+ * Pasaba, por ejemplo, con los pedidos que saltaron de NUEVO directo a
+ * ENVIADO antes de la v2.4.5.
+ *
+ * Parámetros (GET), solo admin:
+ *   aplicar  "SI" para escribir los cambios; si no, solo muestra qué haría.
+ *   desde    "yyyy-MM-dd" (opcional): ignora pedidos anteriores a esa fecha.
+ *            Sirve para no tocar pedidos viejos cuyo stock ya se corrigió
+ *            a mano (por ejemplo con un inventario).
+ *
+ * Es seguro repetirlo: cada pedido corregido queda con STOCK_DESCONTADO=SI
+ * y no vuelve a aparecer.
+ */
+function repararStockPedidos(e){
+  const p = (e && e.parameter) || {};
+  const aplicar = String(p.aplicar || "").toUpperCase() === "SI";
+  const desde = String(p.desde || "").trim();
+  if(desde && !/^\d{4}-\d{2}-\d{2}$/.test(desde)){
+    return jsonResponse({ success:false, message:"La fecha 'desde' tiene que ser yyyy-MM-dd." });
+  }
+
+  const zona = zonaNegocio();
+  const hojaPed = getHoja("PEDIDOS");
+  const hojaDet = getHoja("DETALLE_PEDIDOS");
+  const hojaProd = getSheet();
+  if(!hojaPed || !hojaDet || !hojaProd) return jsonResponse({ success:false, message:"Faltan hojas (PEDIDOS, DETALLE_PEDIDOS o PRODUCTOS)." });
+
+  let lock = null;
+  if(aplicar){
+    lock = LockService.getScriptLock();
+    if(!lock.tryLock(20000)) return jsonResponse({ success:false, message:"El sistema está ocupado. Probá de nuevo en unos segundos." });
+  }
+
+  try{
+    const datosPed = hojaPed.getDataRange().getValues();
+    const enc = (datosPed[0] || []).map(h => String(h || "").trim());
+    const iId = enc.indexOf("PEDIDO_ID"), iFecha = enc.indexOf("FECHA"), iCli = enc.indexOf("NOMBRE");
+    const iEstado = enc.indexOf("ESTADO"), iFlag = enc.indexOf("STOCK_DESCONTADO");
+    if(iId === -1 || iEstado === -1 || iFlag === -1){
+      return jsonResponse({ success:false, message:"La hoja PEDIDOS no tiene las columnas PEDIDO_ID, ESTADO y STOCK_DESCONTADO." });
+    }
+
+    // detalle agrupado por pedido
+    const detallePorPedido = {};
+    hojaDet.getDataRange().getValues().slice(1).forEach(r => {
+      const id = String(r[0]);
+      (detallePorPedido[id] = detallePorPedido[id] || []).push({ codigo: String(r[1] || "").trim(), cantidad: Number(r[3]) || 0 });
+    });
+
+    const pedidos = [];
+    const sinDetalle = [];
+    const deltas = {};
+    const filasAMarcar = [];
+    for(let i = 1; i < datosPed.length; i++){
+      const fila = datosPed[i];
+      const estado = String(fila[iEstado] || "").toUpperCase();
+      if(estado !== "PREPARANDO" && estado !== "ENVIADO") continue;
+      if(String(fila[iFlag] || "").toUpperCase() === "SI") continue;
+      const fecha = iFecha === -1 || !fila[iFecha] ? "" : Utilities.formatDate(new Date(fila[iFecha]), zona, "yyyy-MM-dd");
+      if(desde && fecha && fecha < desde) continue;
+      const id = String(fila[iId]);
+      const items = (detallePorPedido[id] || []).filter(x => x.codigo && x.cantidad);
+      if(items.length === 0){ sinDetalle.push(id); continue; }
+      items.forEach(x => { deltas[x.codigo] = (deltas[x.codigo] || 0) - x.cantidad; });
+      pedidos.push({ pedidoId: id, fecha: fecha, cliente: iCli === -1 ? "" : String(fila[iCli] || ""), estado: estado, items: items.length });
+      filasAMarcar.push(i);
+    }
+
+    // stock actual de los productos afectados
+    const datosProd = hojaProd.getDataRange().getValues();
+    const encP = (datosProd[0] || []).map(h => String(h || "").trim());
+    const pCod = encP.indexOf("CODIGO"), pNom = encP.indexOf("PRODUCTO"), pStock = encP.indexOf("STOCK");
+    const info = {};
+    for(let i = 1; i < datosProd.length; i++){
+      const c = String(datosProd[i][pCod] || "").trim();
+      if(c && Object.prototype.hasOwnProperty.call(deltas, c) && !info[c]){
+        info[c] = { producto: pNom === -1 ? "" : String(datosProd[i][pNom] || ""), stock: Number(datosProd[i][pStock]) || 0 };
+      }
+    }
+    const productos = [];
+    const codigosInexistentes = [];
+    Object.keys(deltas).forEach(c => {
+      if(!info[c]){ codigosInexistentes.push(c); return; }
+      productos.push({ codigo: c, producto: info[c].producto, stockActual: info[c].stock, aDescontar: -deltas[c], stockResultante: info[c].stock + deltas[c] });
+    });
+    productos.sort((a, b) => String(a.producto).localeCompare(String(b.producto)));
+
+    if(aplicar && pedidos.length > 0){
+      const aplicables = {};
+      productos.forEach(x => { aplicables[x.codigo] = deltas[x.codigo]; });
+      const nuevos = aplicarDeltasStock(aplicables, false);
+      filasAMarcar.forEach(i => hojaPed.getRange(i + 1, iFlag + 1).setValue("SI"));
+      try{ notificarCambioStock(nuevos); }catch(err){ console.error("repararStockPedidos notificar: " + err.message); }
+      invalidarCachePolling();
+      try{ invalidarCacheProductos(); }catch(err){ /* el caché vence solo */ }
+    }
+
+    return jsonResponse({
+      success:true,
+      aplicado: aplicar && pedidos.length > 0,
+      desde: desde,
+      pedidos: pedidos,
+      productos: productos,
+      sinDetalle: sinDetalle,
+      codigosInexistentes: codigosInexistentes
+    });
+  } finally {
+    if(lock) lock.releaseLock();
+  }
+}
+
 function obtenerMetricasCompleto() {
 
   const ss = getSS();
