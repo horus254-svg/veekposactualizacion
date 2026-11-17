@@ -1,0 +1,8 @@
+version: 2.4.13
+files:
+  - url: https://github.com/horus254-svg/veekposactualizacion/releases/download/v2.4.13/VeekPOS-Setup-2.4.13.exe
+    sha512: xy036h49JYowuJArUFzIaT8EH1FhQtO6u1iMF5zHqLxJROV2yuPBgLaZCJTMKQ4UsivpkR9cKID5Fug1KMn4Fw==
+    size: 90050387
+path: https://github.com/horus254-svg/veekposactualizacion/releases/download/v2.4.13/VeekPOS-Setup-2.4.13.exe
+sha512: xy036h49JYowuJArUFzIaT8EH1FhQtO6u1iMF5zHqLxJROV2yuPBgLaZCJTMKQ4UsivpkR9cKID5Fug1KMn4Fw==
+releaseDate: '2026-11-17T18:32:46.452Z'
